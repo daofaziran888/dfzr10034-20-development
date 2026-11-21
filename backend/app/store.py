@@ -27,6 +27,18 @@ class Store:
         self._change_log: list[dict[str, Any]] = []
         self._snapshots: dict[str, list[dict[str, Any]]] = {}
         self._pipeline_state: dict[str, dict[str, Any]] = {}
+        # 冷副本签收回执：与冷副本一一对应，重复提交只能命中这里已生效的那一条。
+        self._receipts: list[dict[str, Any]] = []
+        # 凭单签收后同步出的可读分区：工作台重新进入时读这里，而不是重新拼一份。
+        self._readable_partitions: dict[str, dict[str, Any]] = {}
+        # 冷副本与凭单：按分区保存每一代归档副本及其完整性凭单。
+        self._cold_copies: dict[str, dict[str, Any]] = {}
+        self._vouchers: dict[str, dict[str, Any]] = {}
+        self._partition_copies: dict[str, list[str]] = {}
+        self._voucher_seq = 0
+        self._receipt_seq = 0
+        # 热端分区镜像：清退的判定对象，只有凭单校验通过才允许删。
+        self._hot_partitions: dict[str, dict[str, Any]] = {}
 
     def reset(self) -> None:
         """清空所有数据并重新种子化（测试用）。"""
@@ -254,8 +266,75 @@ class Store:
                     break
         return results
 
-    # ── 管线状态 ──────────────────────────────────────────────
+    # ── 冷副本凭单与可读分区 ──────────────────────────────────
 
+    def get_readable_partition(self, partition: str) -> dict[str, Any] | None:
+        """读取凭单同步出来的可读分区（工作台重新进入时的唯一读取入口）。"""
+        return self._readable_partitions.get(partition)
+
+    def set_readable_partition(self, partition: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """覆盖写入可读分区，返回写入后的内容。"""
+        self._readable_partitions[partition] = payload
+        return payload
+
+    def all_readable_partitions(self) -> dict[str, dict[str, Any]]:
+        return dict(self._readable_partitions)
+
+    def find_receipt(self, copy_id: str) -> dict[str, Any] | None:
+        """按冷副本编号查找已生效的签收回执。"""
+        for receipt in self._receipts:
+            if receipt.get("copy_id") == copy_id:
+                return receipt
+        return None
+
+    def add_receipt(self, receipt: dict[str, Any]) -> dict[str, Any]:
+        self._receipts.append(receipt)
+        return receipt
+
+    def receipts(self) -> list[dict[str, Any]]:
+        return list(self._receipts)
+
+    def next_voucher_no(self) -> int:
+        self._voucher_seq += 1
+        return self._voucher_seq
+
+    def next_receipt_no(self) -> int:
+        self._receipt_seq += 1
+        return self._receipt_seq
+
+    def put_cold_copy(self, copy: dict[str, Any]) -> dict[str, Any]:
+        """保存一份冷副本，并把它挂到对应分区名下。"""
+        self._cold_copies[copy["copy_id"]] = copy
+        self._partition_copies.setdefault(copy["partition"], []).append(copy["copy_id"])
+        return copy
+
+    def get_cold_copy(self, copy_id: str) -> dict[str, Any] | None:
+        return self._cold_copies.get(copy_id)
+
+    def copies_for_partition(self, partition: str) -> list[dict[str, Any]]:
+        return [self._cold_copies[cid] for cid in self._partition_copies.get(partition, [])]
+
+    def put_voucher(self, voucher: dict[str, Any]) -> dict[str, Any]:
+        self._vouchers[voucher["voucher_no"]] = voucher
+        return voucher
+
+    def get_voucher(self, voucher_no: str) -> dict[str, Any] | None:
+        return self._vouchers.get(voucher_no)
+
+    def all_vouchers(self) -> list[dict[str, Any]]:
+        return list(self._vouchers.values())
+
+    def vouchers_for_partition(self, partition: str) -> list[dict[str, Any]]:
+        return [v for v in self._vouchers.values() if v["partition"] == partition]
+
+    def set_hot_partition(self, partition: str, payload: dict[str, Any]) -> dict[str, Any]:
+        self._hot_partitions[partition] = payload
+        return payload
+
+    def get_hot_partition(self, partition: str) -> dict[str, Any] | None:
+        return self._hot_partitions.get(partition)
+
+    # ── 管线状态 ──────────────────────────────────────────────
     def set_pipeline_state(self, pipeline: str, state: dict[str, Any]) -> None:
         self._pipeline_state[pipeline] = state
 

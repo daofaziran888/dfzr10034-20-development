@@ -73,6 +73,45 @@ npm run dev
 | 差异报告 | `diff_report` | 差异记录 | 记录编号、比较对象、比较维度 |
 | 负责人管理 | `owner_mgr` | 责任人 | 指派编号、目标资产、负责角色 |
 
+## 冷副本完整性凭单
+
+冷热归档在冷库按分区写入清单，签收后生成一份可持久化的完整性凭单
+（`backend/app/services/cold_integrity.py`，接口前缀 `/api/cold-integrity`）。
+
+- 凭单记录：分区、冷副本编号、交接代次、行数、逐行摘要、整体内容摘要和行内容快照。
+- 同一冷副本重复提交回执只生效一次，不重复生成凭单或推进代次。
+- 签收后归档汇总同步更新可读分区；工作台重新进入时读可读分区
+  （`GET /api/cold-integrity/partitions/{partition}/readable`），
+  读到的行内容与持久化凭单一致。
+- 恢复按交接代次逐行核对实际行内容（`POST /api/cold-integrity/vouchers/{no}/restore`），
+  而不是只比较行数。
+- 热端清退由凭单驱动（`GET .../clearance`、`POST .../retire`）：
+  行数相同但内容不同时直接拒绝，不得仅凭条数相等放行。
+
+P12 分区示例（两代均为 3 行，金额分别为 12/14/18 与 12/41/18）：
+
+```bash
+B=http://127.0.0.1:8000
+post() { curl -s -X POST -H 'Content-Type: application/json' -d "$2" "$B$1"; }
+
+post /api/cold-integrity/copies '{"partition":"P12","copy_id":"P12-G1","rows":[{"id":1,"金额":12},{"id":2,"金额":14},{"id":3,"金额":18}]}'
+post /api/cold-integrity/copies/P12-G1/receipt '{}'        # VCH-0001，第 1 代
+post /api/cold-integrity/copies '{"partition":"P12","copy_id":"P12-G2","rows":[{"id":1,"金额":12},{"id":2,"金额":41},{"id":3,"金额":18}]}'
+post /api/cold-integrity/copies/P12-G2/receipt '{}'        # VCH-0002，第 2 代
+post /api/cold-integrity/copies/P12-G1/receipt '{}'        # 重复回执：applied=false
+
+# 热端订正为 41 后，拿第 1 代凭单（14）清退会被拒；第 2 代凭单可清退
+curl -s -X PUT -H 'Content-Type: application/json' \
+  -d '{"partition":"P12","rows":[{"id":1,"金额":12},{"id":2,"金额":41},{"id":3,"金额":18}]}' \
+  "$B/api/cold-integrity/partitions/P12/hot"
+curl -s "$B/api/cold-integrity/partitions/P12/clearance?voucher_no=VCH-0001"
+curl -s "$B/api/cold-integrity/partitions/P12/clearance?voucher_no=VCH-0002"
+
+# 按交接代次恢复出各自的金额
+post "/api/cold-integrity/vouchers/VCH-0001/restore?generation=1" '{}'   # [12, 14, 18]
+post "/api/cold-integrity/vouchers/VCH-0002/restore?generation=2" '{}'   # [12, 41, 18]
+```
+
 ## 约定
 
 - 全部模块共享`frontend/src/views/WorkbenchView.vue|tsx`和一套资源路由。

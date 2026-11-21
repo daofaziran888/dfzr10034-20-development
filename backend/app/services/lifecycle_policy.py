@@ -23,8 +23,21 @@ class LifecyclePolicyService(BaseModuleService):
 
     STAGES = ["创建阶段", "活跃阶段", "保留阶段", "归档阶段", "销毁阶段"]
 
-    def transition_stage(self, policy_id: int, to_stage: str) -> dict[str, Any]:
-        """流转生命周期策略到指定阶段，自动触发冷归档或保留清理（Pipeline 4 入口）。"""
+    def transition_stage(
+        self,
+        policy_id: int,
+        to_stage: str,
+        *,
+        partition: str | None = None,
+        source_rows: list[dict[str, Any]] | None = None,
+        copy_id: str | None = None,
+        sign_receipt: bool = True,
+    ) -> dict[str, Any]:
+        """流转生命周期策略到指定阶段，自动触发冷归档或保留清理（Pipeline 4 入口）。
+
+        流转到归档阶段时，若提供 ``source_rows``，会同步在冷库写入分区清单并
+        签收完整性凭单；否则只建待执行的归档任务，等待后续补写清单。
+        """
         policy = self.get_entry(policy_id)
         if not policy:
             return {"ok": False, "error": "策略不存在"}
@@ -44,10 +57,29 @@ class LifecyclePolicyService(BaseModuleService):
             archive_task = self._trigger_cold_archive(policy)
             result["cold_archive"] = archive_task
             result["actions"].append("cold_archive")
+            if source_rows is not None:
+                from app.services.cold_archive import ColdArchiveService
+
+                archive_result = ColdArchiveService().execute_archive(
+                    archive_task["id"],
+                    len(source_rows),
+                    partition=partition,
+                    source_rows=source_rows,
+                    copy_id=copy_id,
+                    sign_receipt=sign_receipt,
+                )
+                result["archive_result"] = archive_result
+                result["manifest"] = archive_result.get("manifest")
+                result["receipt"] = archive_result.get("receipt")
+                if not archive_result.get("ok"):
+                    result["ok"] = False
+                    result["error"] = archive_result.get("error", "冷副本写入或签收失败")
             self.emit_event("lifecycle_archiving", {
                 "policy_id": policy_id,
                 "asset_code": policy.get("目标资产", ""),
                 "archive_task_id": archive_task["id"] if archive_task else None,
+                "partition": partition,
+                "voucher_no": (result.get("receipt") or {}).get("voucher", {}).get("voucher_no"),
             })
 
         # 销毁阶段：触发保留清理
